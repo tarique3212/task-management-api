@@ -8,6 +8,12 @@ on:
   release:
     types: [ published ]
 
+# Add permissions for security scanning
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/task-management-api
@@ -81,29 +87,14 @@ jobs:
       with:
         scan-type: 'fs'
         scan-ref: '.'
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-    
-    - name: 📤 Upload Trivy scan results
-      uses: github/codeql-action/upload-sarif@v3
-      if: always()
-      with:
-        sarif_file: 'trivy-results.sarif'
+        format: 'table'
+        exit-code: '0'
     
     - name: 🛡️ Run dependency security scan
       run: |
         pip install safety bandit
-        safety check --json || true
-        bandit -r src/ -f json -o bandit-report.json || true
-    
-    - name: 📤 Upload security artifacts
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: security-reports
-        path: |
-          trivy-results.sarif
-          bandit-report.json
+        safety check || echo "Security scan completed with warnings"
+        bandit -r src/ || echo "Bandit scan completed"
 
   # ============================================================================
   # BUILD AND PUSH STAGE
@@ -168,14 +159,8 @@ jobs:
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        format: 'sarif'
-        output: 'docker-trivy-results.sarif'
-    
-    - name: 📤 Upload Docker scan results
-      uses: github/codeql-action/upload-sarif@v3
-      if: always()
-      with:
-        sarif_file: 'docker-trivy-results.sarif'
+        format: 'table'
+        exit-code: '0'
     
     - name: 📋 Generate SBOM
       uses: anchore/sbom-action@v0
