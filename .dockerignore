@@ -1,0 +1,21 @@
+# .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+.pytest_cache/
+.git/
+.gitignore
+README.md
+DEPLOYMENT.md
+.github/
+k8s/
+*.md
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db

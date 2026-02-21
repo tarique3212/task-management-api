@@ -1,0 +1,415 @@
+name: Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+  release:
+    types: [ published ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/task-management-api
+  HELM_CHART_PATH: helm/task-management-api
+
+jobs:
+  # ============================================================================
+  # TESTING STAGE
+  # ============================================================================
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.11]
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+    
+    - name: 🐍 Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: 📦 Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: 🔧 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest-cov pytest-xdist
+    
+    - name: 🧪 Run unit tests with coverage
+      run: |
+        pytest test_app.py -v --tb=short --cov=src --cov-report=xml --cov-report=term-missing
+    
+    - name: 📊 Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+    
+    - name: 🔍 Run linting
+      run: |
+        pip install flake8 black isort mypy
+        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        black --check src/
+        isort --check-only src/
+        mypy src/ --ignore-missing-imports
+
+  # ============================================================================
+  # SECURITY SCANNING STAGE
+  # ============================================================================
+  security:
+    name: 🔒 Security Scanning
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+    
+    - name: 🔍 Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: 📤 Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: 🛡️ Run dependency security scan
+      run: |
+        pip install safety bandit
+        safety check --json || true
+        bandit -r src/ -f json -o bandit-report.json || true
+    
+    - name: 📤 Upload security artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          trivy-results.sarif
+          bandit-report.json
+
+  # ============================================================================
+  # BUILD AND PUSH STAGE
+  # ============================================================================
+  build:
+    name: 🐳 Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-uri: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+    
+    - name: 🔧 Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: 🔐 Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: 🏷️ Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+        labels: |
+          org.opencontainers.image.title=Task Management API
+          org.opencontainers.image.description=FastAPI-based task management system
+          org.opencontainers.image.vendor=Your Organization
+    
+    - name: 🐳 Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
+          REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+    
+    - name: 🔍 Scan Docker image for vulnerabilities
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'docker-trivy-results.sarif'
+    
+    - name: 📤 Upload Docker scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'docker-trivy-results.sarif'
+    
+    - name: 📋 Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        format: spdx-json
+        output-file: sbom.spdx.json
+    
+    - name: 📤 Upload SBOM
+      uses: actions/upload-artifact@v3
+      with:
+        name: sbom
+        path: sbom.spdx.json
+
+  # ============================================================================
+  # HELM CHART VALIDATION
+  # ============================================================================
+  helm-validate:
+    name: ⎈ Validate Helm Chart
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+    
+    - name: ⎈ Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'latest'
+    
+    - name: 🔍 Lint Helm chart
+      run: |
+        helm lint ${{ env.HELM_CHART_PATH }}
+        helm lint ${{ env.HELM_CHART_PATH }} -f ${{ env.HELM_CHART_PATH }}/values-dev.yaml
+        helm lint ${{ env.HELM_CHART_PATH }} -f ${{ env.HELM_CHART_PATH }}/values-prod.yaml
+    
+    - name: 🧪 Template Helm chart
+      run: |
+        helm template test-release ${{ env.HELM_CHART_PATH }}
+        helm template test-release ${{ env.HELM_CHART_PATH }} -f ${{ env.HELM_CHART_PATH }}/values-dev.yaml
+        helm template test-release ${{ env.HELM_CHART_PATH }} -f ${{ env.HELM_CHART_PATH }}/values-prod.yaml
+    
+    - name: 📦 Package Helm chart
+      run: |
+        helm package ${{ env.HELM_CHART_PATH }} --destination ./charts/
+    
+    - name: 📤 Upload Helm chart
+      uses: actions/upload-artifact@v3
+      with:
+        name: helm-chart
+        path: ./charts/*.tgz
+
+  # ============================================================================
+  # DEPLOY TO DEVELOPMENT
+  # ============================================================================
+  deploy-dev:
+    name: 🚀 Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [build, helm-validate]
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'pull_request'
+    environment: development
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+    
+    - name: ⎈ Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: ⎈ Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'latest'
+    
+    - name: 🔧 Configure kubectl for development
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBE_CONFIG_DEV }}" | base64 -d > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+    
+    - name: 🚀 Deploy with Helm to development
+      run: |
+        helm upgrade --install task-api-dev ${{ env.HELM_CHART_PATH }} \
+          --namespace development \
+          --create-namespace \
+          --values ${{ env.HELM_CHART_PATH }}/values-dev.yaml \
+          --set image.registry=${{ env.REGISTRY }} \
+          --set image.repository=${{ env.IMAGE_NAME }} \
+          --set image.tag=${{ github.sha }} \
+          --wait \
+          --timeout=300s
+    
+    - name: 🧪 Run Helm tests
+      run: |
+        helm test task-api-dev --namespace development
+    
+    - name: ✅ Verify deployment
+      run: |
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=task-management-api -n development --timeout=300s
+        kubectl get pods -n development -l app.kubernetes.io/name=task-management-api
+
+  # ============================================================================
+  # DEPLOY TO STAGING
+  # ============================================================================
+  deploy-staging:
+    name: 🎭 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, helm-validate]
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+    
+    - name: ⎈ Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: ⎈ Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'latest'
+    
+    - name: 🔧 Configure kubectl for staging
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+    
+    - name: 🚀 Deploy with Helm to staging
+      run: |
+        helm upgrade --install task-api-staging ${{ env.HELM_CHART_PATH }} \
+          --namespace staging \
+          --create-namespace \
+          --set image.registry=${{ env.REGISTRY }} \
+          --set image.repository=${{ env.IMAGE_NAME }} \
+          --set image.tag=${{ github.sha }} \
+          --wait \
+          --timeout=600s
+    
+    - name: 🧪 Run integration tests
+      run: |
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=task-management-api -n staging --timeout=300s
+        # Add your integration test commands here
+        echo "Running integration tests..."
+    
+    - name: 📊 Run performance tests
+      run: |
+        # Add performance testing commands here
+        echo "Running performance tests..."
+
+  # ============================================================================
+  # DEPLOY TO PRODUCTION
+  # ============================================================================
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.event_name == 'release'
+    environment: production
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+    
+    - name: ⎈ Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: ⎈ Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: 'latest'
+    
+    - name: 🔧 Configure kubectl for production
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+    
+    - name: 🚀 Deploy with Helm to production
+      run: |
+        helm upgrade --install task-api-prod ${{ env.HELM_CHART_PATH }} \
+          --namespace production \
+          --create-namespace \
+          --values ${{ env.HELM_CHART_PATH }}/values-prod.yaml \
+          --set image.registry=${{ env.REGISTRY }} \
+          --set image.repository=${{ env.IMAGE_NAME }} \
+          --set image.tag=${{ github.ref_name }} \
+          --set secret.data.DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+          --set secret.data.SECRET_KEY="${{ secrets.SECRET_KEY }}" \
+          --wait \
+          --timeout=900s
+    
+    - name: ✅ Verify production deployment
+      run: |
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=task-management-api -n production --timeout=600s
+        kubectl get pods -n production -l app.kubernetes.io/name=task-management-api
+    
+    - name: 🔔 Notify deployment success
+      uses: 8398a7/action-slack@v3
+      if: success()
+      with:
+        status: success
+        text: '🎉 Task Management API v${{ github.ref_name }} deployed successfully to production!'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: 🚨 Notify deployment failure
+      uses: 8398a7/action-slack@v3
+      if: failure()
+      with:
+        status: failure
+        text: '💥 Task Management API v${{ github.ref_name }} deployment to production failed!'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ============================================================================
+  # CLEANUP
+  # ============================================================================
+  cleanup:
+    name: 🧹 Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: 🗑️ Clean up old images
+      run: |
+        echo "Cleaning up old container images..."
+        # Add cleanup logic here

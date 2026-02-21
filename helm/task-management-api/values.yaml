@@ -1,0 +1,23 @@
+# Simple values for Task Management API
+app:
+  name: task-management-api
+  version: "2.0.0"
+
+image:
+  repository: task-management-api
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+service:
+  type: LoadBalancer
+  port: 80
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
