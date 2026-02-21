@@ -146,19 +146,6 @@ jobs:
     
     - name: ✅ Docker build completed
       run: echo "Docker image built successfully for testing"
-    
-    - name: 📋 Generate SBOM
-      uses: anchore/sbom-action@v0
-      with:
-        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        format: spdx-json
-        output-file: sbom.spdx.json
-    
-    - name: 📤 Upload SBOM
-      uses: actions/upload-artifact@v4
-      with:
-        name: sbom
-        path: sbom.spdx.json
 
   # ============================================================================
   # HELM CHART VALIDATION
